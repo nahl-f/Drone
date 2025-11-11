@@ -1,0 +1,7 @@
+/venv/
+/WAV/
+/drone-audio-detection-samples/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
