@@ -2,6 +2,7 @@
 /WAV/
 /drone-audio-detection-samples/
 __pycache__/
+/Spectograms/
 *.pyc
 *.pyo
 *.pyd

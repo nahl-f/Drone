@@ -1,223 +1,168 @@
-# preprocess_train.py
 import os
-import glob
-import numpy as np
-import soundfile as sf
-import librosa
-from tqdm import tqdm
+import json
 import random
 import torch
+import torchaudio
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-from sklearn.metrics import accuracy_score
-import time
-import json
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import soundfile as sf
 
-# -------------------------
-# USER CONFIG
-# -------------------------
-WAV_DIR = r"C:\Users\nahlf\Desktop\Drone\WAV"    # folder with your .wav files
-SPEC_DIR = r"C:\Users\nahlf\Desktop\Drone\samples"  # output folder for .npy spectrograms
-MODEL_DIR = r"C:\Users\nahlf\Desktop\Drone\MODEL" # where model + artifacts saved
-os.makedirs(SPEC_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-# Spectrogram params (must match in inference)
-SR = 16000
-N_MELS = 128
-FMAX = 8000
-N_FFT = 2048
-HOP_LENGTH = 512
-
-# Target number of time frames in spectrogram (makes fixed-size inputs)
-TARGET_FRAMES = 128   # -> final shape: (1, N_MELS, TARGET_FRAMES)
-
-# Training params
+# ======================
+# CONFIG
+# ======================
+SAMPLE_RATE = 16000
+CLIP_DURATION = 1.0  # seconds
+CLIP_SAMPLES = int(SAMPLE_RATE * CLIP_DURATION)
 BATCH_SIZE = 64
-LR = 1e-3
-EPOCHS = 20
-VAL_SPLIT = 0.1
-SEED = 42
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", DEVICE)
+EPOCHS = 10
+DATA_DIR = r"C:\Users\nahlf\Desktop\Drone\WAV"
+OUTPUT_DIR = r"C:\Users\nahlf\Desktop\Drone\MODEL"
 
-# -------------------------
-# 1) Convert WAV -> mel spectrogram .npy files
-# -------------------------
-def wav_to_mel_npy(wav_path, out_path):
-    y, sr = sf.read(wav_path)
-    if y.ndim > 1:
-        y = y[:,0]
-    if sr != SR:
-        y = librosa.resample(y, orig_sr=sr, target_sr=SR)
-        sr = SR
-    # compute mel spectrogram (power)
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, fmax=FMAX)
-    S_dB = librosa.power_to_db(S, ref=np.max)  # shape: (N_MELS, frames)
-    # ensure dtype float32
-    S_dB = S_dB.astype(np.float32)
-    np.save(out_path, S_dB)
+# ======================
+# DATASET
+# ======================
+class DroneDataset(Dataset):
+    def __init__(self, manifest_path, sample_rate=16000, clip_samples=16000):
+        with open(manifest_path, "r") as f:
+            self.data = json.load(f)
 
-# Process all wav files
-wav_files = sorted(glob.glob(os.path.join(WAV_DIR, "*.wav")))
-if not wav_files:
-    raise SystemExit("No wav files found in WAV_DIR")
-
-print(f"Converting {len(wav_files)} WAVs to Mel spectrograms in {SPEC_DIR} ...")
-manifest = []
-for wav in tqdm(wav_files):
-    fname = os.path.basename(wav)
-    label = 1 if fname.lower().startswith("drone") else 0
-    out_name = os.path.splitext(fname)[0] + ".npy"
-    out_path = os.path.join(SPEC_DIR, out_name)
-    if not os.path.exists(out_path):  # skip if already exists
-        wav_to_mel_npy(wav, out_path)
-    manifest.append({"wav": wav, "spec": out_path, "label": int(label)})
-
-# Save manifest
-manifest_path = os.path.join(MODEL_DIR, "manifest.npy")
-np.save(manifest_path, manifest)
-with open(os.path.join(MODEL_DIR, "manifest.json"), "w") as f:
-    json.dump(manifest[:1000], f, indent=2)  # small sample for inspection
-print("Saved sample manifest to MODEL_DIR")
-
-# -------------------------
-# 2) Dataset + DataLoader
-# -------------------------
-class SpecDataset(Dataset):
-    def __init__(self, manifest, target_frames=TARGET_FRAMES, augment=False):
-        self.items = manifest
-        self.target_frames = target_frames
-        self.augment = augment
-
-    def __len__(self):
-        return len(self.items)
-
-    def _pad_or_trim(self, S):
-        # S shape: (n_mels, frames)
-        n_mels, frames = S.shape
-        if frames < self.target_frames:
-            pad_width = self.target_frames - frames
-            S = np.pad(S, ((0,0),(0,pad_width)), mode='constant', constant_values=(S.min(),))
-        elif frames > self.target_frames:
-            # random crop during training
-            start = 0
-            if self.augment:
-                start = np.random.randint(0, frames - self.target_frames + 1)
-            S = S[:, start:start + self.target_frames]
-        return S
-
-    def __getitem__(self, idx):
-        rec = self.items[idx]
-        S = np.load(rec["spec"])  # shape (n_mels, frames)
-        S = self._pad_or_trim(S)
-        # normalize per-sample
-        S = (S - S.mean()) / (S.std() + 1e-6)
-        # convert to shape (1, n_mels, frames)
-        S = np.expand_dims(S, 0).astype(np.float32)
-        label = np.int64(rec["label"])
-        return S, label
-
-# create dataset
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-manifest_all = np.load(manifest_path, allow_pickle=True)
-manifest_all = list(manifest_all)
-
-dataset = SpecDataset(manifest_all, augment=True)
-total = len(dataset)
-val_size = int(total * VAL_SPLIT)
-train_size = total - val_size
-train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(SEED))
-print(f"Total samples: {total}, train: {len(train_ds)}, val: {len(val_ds)}")
-
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-
-# -------------------------
-# 3) Define CNN model
-# -------------------------
-class SmallCNN(nn.Module):
-    def __init__(self, in_ch=1, n_classes=1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 16, kernel_size=3, padding=1), nn.BatchNorm2d(16), nn.ReLU(),
-            nn.MaxPool2d((2,2)),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d((2,2)),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d((2,2)),
-            nn.AdaptiveAvgPool2d((1,1)),
-            nn.Flatten(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, n_classes)
+        self.sample_rate = sample_rate
+        self.clip_samples = clip_samples
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=512,
+            hop_length=256,
+            n_mels=64
         )
 
+    def __len__(self):
+        return len(self.data)
+
+    def _fix_length(self, waveform):
+        num_samples = waveform.shape[1]
+        if num_samples < self.clip_samples:
+            pad_amount = self.clip_samples - num_samples
+            waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
+        elif num_samples > self.clip_samples:
+            waveform = waveform[:, :self.clip_samples]
+        return waveform
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        # ✅ Use soundfile instead of torchaudio.load to avoid FFmpeg issues
+        wav, sr = sf.read(item["path"])
+        if len(wav.shape) > 1:
+            wav = wav.mean(axis=1)  # convert to mono
+        # ✅ FIX: Convert to float32 to match PyTorch's expected dtype
+        wav = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)
+
+        if sr != self.sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+
+        wav = self._fix_length(wav)
+        mel = self.mel_transform(wav)
+        # ✅ FIX: Use amplitude_to_DB with all required parameters
+        mel = torchaudio.functional.amplitude_to_DB(
+            mel, 
+            multiplier=10.0, 
+            amin=1e-10, 
+            db_multiplier=0.0, 
+            top_db=80.0
+        )
+        return mel, torch.tensor(item["label"], dtype=torch.long)
+
+# ======================
+# MODEL
+# ======================
+class DroneCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 16, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        
+        # Calculate the correct flattened size dynamically
+        self.flatten = nn.Flatten()
+        
+        # Placeholder - will be set after first forward pass
+        self.fc_layers = None
+
     def forward(self, x):
-        return self.net(x)
+        x = self.conv_layers(x)
+        x = self.flatten(x)
+        
+        # Initialize FC layers on first forward pass
+        if self.fc_layers is None:
+            flattened_size = x.shape[1]
+            self.fc_layers = nn.Sequential(
+                nn.Linear(flattened_size, 64),
+                nn.ReLU(),
+                nn.Linear(64, 2)
+            ).to(x.device)
+        
+        return self.fc_layers(x)
 
-model = SmallCNN().to(DEVICE)
-print(model)
+# ======================
+# BUILD MANIFEST
+# ======================
+def build_manifest():
+    files = [f for f in os.listdir(DATA_DIR) if f.endswith(".wav")]
+    drone_files = [os.path.join(DATA_DIR, f) for f in files if "drone" in f.lower()]
+    bg_files = [os.path.join(DATA_DIR, f) for f in files if "background" in f.lower()]
 
-# -------------------------
-# 4) Training loop
-# -------------------------
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
-best_val_acc = 0.0
-best_model_path = os.path.join(MODEL_DIR, "best_model.pt")
+    if not drone_files or not bg_files:
+        raise ValueError("No drone/background files found. Make sure filenames include 'drone' or 'background'.")
 
-for epoch in range(1, EPOCHS+1):
-    t0 = time.time()
-    model.train()
-    train_losses = []
-    preds = []
-    trues = []
-    for xb, yb in train_loader:
-        xb = xb.to(DEVICE, non_blocking=True)
-        yb = yb.to(DEVICE, non_blocking=True).float()
-        optimizer.zero_grad()
-        out = model(xb).squeeze(1)
-        loss = criterion(out, yb)
-        loss.backward()
-        optimizer.step()
-        train_losses.append(loss.item())
-        preds += (torch.sigmoid(out).detach().cpu().numpy() > 0.5).astype(int).tolist()
-        trues += yb.cpu().numpy().astype(int).tolist()
-    train_acc = accuracy_score(trues, preds)
-    train_loss = float(np.mean(train_losses))
+    n = min(len(drone_files), len(bg_files), 5000)
+    random.seed(42)
+    drone_samples = random.sample(drone_files, n)
+    bg_samples = random.sample(bg_files, n)
 
-    # validation
-    model.eval()
-    val_preds = []
-    val_trues = []
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb = xb.to(DEVICE, non_blocking=True)
-            yb = yb.to(DEVICE, non_blocking=True).float()
-            out = model(xb).squeeze(1)
-            val_preds += (torch.sigmoid(out).cpu().numpy() > 0.5).astype(int).tolist()
-            val_trues += yb.cpu().numpy().astype(int).tolist()
-    val_acc = accuracy_score(val_trues, val_preds)
+    manifest = [{"path": f, "label": 1} for f in drone_samples] + [{"path": f, "label": 0} for f in bg_samples]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    manifest_path = os.path.join(OUTPUT_DIR, "manifest.json")
 
-    elapsed = time.time() - t0
-    print(f"Epoch {epoch}/{EPOCHS} — train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, val_acc: {val_acc:.4f}, time: {elapsed:.1f}s")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
 
-    # checkpoint
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save({
-            "model_state": model.state_dict(),
-            "cfg": {
-                "SR": SR, "N_MELS": N_MELS, "FMAX": FMAX, "HOP_LENGTH": HOP_LENGTH, "N_FFT": N_FFT,
-                "TARGET_FRAMES": TARGET_FRAMES
-            }
-        }, best_model_path)
-        print("Saved best model ->", best_model_path)
+    print(f"Selected {len(drone_samples)} drone and {len(bg_samples)} background samples ({len(manifest)} total).")
+    print(f"Manifest saved at {manifest_path}")
+    return manifest_path
 
-print("Training complete. Best val acc:", best_val_acc)
+# ======================
+# MAIN
+# ======================
+if __name__ == "__main__":
+    manifest_path = build_manifest()
+    dataset = DroneDataset(manifest_path)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    model = DroneCNN()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+
+    print("\nStarting training...\n")
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        for mel, label in tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
+            mel, label = mel.to(device), label.to(device)
+            opt.zero_grad()
+            preds = model(mel)
+            loss = loss_fn(preds, label)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch+1} done. Avg loss = {avg_loss:.4f}")
+
+    torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "drone_model.pth"))
+    print(f"✅ Model saved to {OUTPUT_DIR}\\drone_model.pth")
